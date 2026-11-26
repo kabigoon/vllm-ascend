@@ -17,6 +17,7 @@
 # This file is a part of the vllm-ascend project.
 #
 
+import os
 from typing import Any
 
 import torch
@@ -28,6 +29,35 @@ from vllm.v1.worker.utils import AttentionGroup
 from vllm_ascend.worker.v2.attn_utils import ring_state_update_skipped
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch
 from vllm_ascend.worker.v2.model_states.default import AscendModelState
+
+
+# ---------------------------------------------------------------------------
+# preflight (branch dsv41-perf, NOT upstream):
+# ``_gather_lookback_kernel`` faults with "vector core exception" on this
+# CANN 9.2.1 + HDK 25.5.1 pair. The gather is tiny (num_reqs x depth tokens,
+# once per step), so a torch equivalent is a safe escape hatch.
+# Enabled only when VLLM_ASCEND_ENGRAM_LOOKBACK_TORCH=1.
+# ---------------------------------------------------------------------------
+_ENGRAM_LOOKBACK_TORCH = os.environ.get("VLLM_ASCEND_ENGRAM_LOOKBACK_TORCH", "") == "1"
+
+
+def _gather_lookback_torch(window, batch, req_states, depth: int) -> None:
+    """Same semantics as ``_gather_lookback_kernel``: row r gets
+    ``all_token_ids[idx_mapping[r], num_computed[r]-1-offs]`` for offs<depth,
+    ``-1`` where the position is before the sequence start or out of batch."""
+    window.fill_(-1)
+    n = int(batch.num_reqs)
+    if n <= 0:
+        return
+    rows = batch.idx_mapping[:n].to(torch.long)
+    all_ids = req_states.all_token_ids.gpu
+    base = req_states.num_computed_tokens.gpu[rows].to(torch.long)
+    offs = torch.arange(depth, device=window.device, dtype=torch.long)
+    pos = base.view(-1, 1) - 1 - offs.view(1, -1)
+    valid = pos >= 0
+    ids = all_ids[rows.view(-1, 1), pos.clamp_min(0)]
+    window[:n].copy_(torch.where(valid, ids, ids.new_full((), -1)))
+
 
 
 class EngramModelState(AscendModelState):
@@ -114,18 +144,21 @@ class EngramModelState(AscendModelState):
         else:
             all_token_ids = req_states.all_token_ids.gpu
             depth = window.shape[1]
-            from vllm_ascend.ops.triton.engram_lookback import _gather_lookback_kernel
+            if _ENGRAM_LOOKBACK_TORCH:
+                _gather_lookback_torch(window, batch, req_states, depth)
+            else:
+                from vllm_ascend.ops.triton.engram_lookback import _gather_lookback_kernel
 
-            _gather_lookback_kernel[(window.shape[0],)](
-                window,
-                batch.idx_mapping,
-                req_states.num_computed_tokens.gpu,
-                all_token_ids,
-                all_token_ids.stride(0),
-                batch.num_reqs,
-                DEPTH=depth,
-                BLOCK_DEPTH=triton.next_power_of_2(depth),
-            )
+                _gather_lookback_kernel[(window.shape[0],)](
+                    window,
+                    batch.idx_mapping,
+                    req_states.num_computed_tokens.gpu,
+                    all_token_ids,
+                    all_token_ids.stride(0),
+                    batch.num_reqs,
+                    DEPTH=depth,
+                    BLOCK_DEPTH=triton.next_power_of_2(depth),
+                )
         model_inputs["lookback_token_ids"] = window
         if self._engram_graph_inputs is not None and self._cg_mode == CUDAGraphMode.FULL:
             graph_inputs = self._engram_graph_inputs

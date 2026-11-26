@@ -8,6 +8,7 @@ export VLLM_USE_V2_MODEL_RUNNER=1
 export VLLM_ENGINE_READY_TIMEOUT_S=36000
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export HCCL_BUFFSIZE=1024
+export VLLM_ASCEND_ENGRAM_LOOKBACK_TORCH=1   # preflight: Triton lookback kernel 在 25.5.1 上崩
 export HCCL_OP_EXPANSION_MODE="AIV"
 exec vllm serve "$MODEL" \
   --host 0.0.0.0 --port "$PORT" --served-model-name dsv41 \
