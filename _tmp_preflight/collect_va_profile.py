@@ -53,8 +53,9 @@ KERNEL_FIELDS = ["Stream ID", "Name", "Type", "Accelerator Core", "Duration(us)"
 # 算子桶：按名字/类型里的关键字归类。顺序敏感（先匹配先归类）。
 BUCKETS = [
     ("indexer", r"indexer|lightning|topk_ind|sparse_index|qli"),
-    ("mla_attn", r"sparse_flash|flash_attn|_mla|mla_|attention|attn"),
-    ("mhc", r"hc_pre|hc_post|mhc|hyper_conn|sinkhorn"),
+    # 注意：kernel 名是驼峰（SparseFlashMla / HcPre / HcPost），下面已 lower 后再匹配
+    ("mla_attn", r"sparse_?flash|flash_?attn|mla|attention|attn"),
+    ("mhc", r"hc_?pre|hc_?post|mhc|hyper_?conn|sinkhorn"),
     ("moe", r"moe|grouped_matmul|gmm|dispatch|combine|gating|expert|swiglu"),
     ("comm", r"hccl|allreduce|all_reduce|allgather|all_gather|reduce_scatter|alltoall|all_to_all|hcom"),
     ("quant", r"quant|dequant|per_token|dynamic_quant"),
