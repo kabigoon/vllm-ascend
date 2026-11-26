@@ -49,3 +49,10 @@ bash _tmp_preflight/bench_client.sh 8900 /home/a00821909/bench
 - `--tokenizer-mode` 没有 `deepseek_v41`，用 **`deepseek_v4`**；`--swa-bounded-replay` 在 v0.30.0 不存在。
 - 镜像树的 `.py` 数（768）≠ tag v0.30.0（714）⇒ **禁止整树挂载**，只允许单文件挂载。
 - -71 上只有 **w4a8** 权重（w8a8 不在），而 sglang 基线是 w8a8 ⇒ 量化不对等，报告里要标。
+
+## 补全镜像树（可选，之后可整树挂载）
+
+```bash
+bash _tmp_preflight/complete_image_tree.sh      # 补 54 个 .py + 全量内容 diff
+PROBE=1 FULLTREE=1 bash _tmp_preflight/run_b.sh # diff 干净时用这个
+```

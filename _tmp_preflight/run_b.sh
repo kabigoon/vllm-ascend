@@ -6,11 +6,16 @@ IMG=${IMG:-quay.io/ascend/vllm-ascend:v0.30.0-a3}
 SELF=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO=$(cd "$SELF/.." && pwd)
 EXTRA=()
-if [ "${PROBE:-0}" = "1" ] && [ -f "$REPO/vllm_ascend/attention/dsa_v41.py" ]; then
+if [ "${FULLTREE:-0}" = "1" ]; then
+  # 整树覆盖：要求先跑过 complete_image_tree.sh，且 diff 只剩 dsa_v41.py
+  EXTRA+=(-v "$REPO/vllm_ascend:/vllm-workspace/vllm-ascend/vllm_ascend")
+  echo "!! 整树挂载 vllm_ascend/（含探针）"
+elif [ "${PROBE:-0}" = "1" ] && [ -f "$REPO/vllm_ascend/attention/dsa_v41.py" ]; then
   EXTRA+=(-v "$REPO/vllm_ascend/attention/dsa_v41.py:/vllm-workspace/vllm-ascend/vllm_ascend/attention/dsa_v41.py")
   EXTRA+=(-e VLLM_VA_PROBE=1)
-  echo "!! 已挂载单文件 dsa_v41.py（VLLM_VA_PROBE=1）—— 先确认它和镜像 md5 一致"
+  echo "!! 已挂载单文件 dsa_v41.py（VLLM_VA_PROBE=1）"
 fi
+if [ "${PROBE:-0}" = "1" ]; then EXTRA+=(-e VLLM_VA_PROBE=1); fi
 docker rm -f dsv41-va >/dev/null 2>&1 || true
 exec docker run --rm -it --name dsv41-va \
   --net=host --ipc=host -e ASCEND_VISIBLE_DEVICES=0-15 "${EXTRA[@]}" \
