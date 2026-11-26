@@ -8,6 +8,8 @@ before running the compressor, indexer and sparse-attention operators without
 moving cache or scheduler knowledge back into the model.
 """
 
+import os
+
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from typing import Any
@@ -48,6 +50,11 @@ from vllm_ascend.worker.device_metadata import (
     DeviceMetadataTask,
     wait_for_device_metadata,
 )
+
+# --- preflight probe (dsv41-perf branch, not part of upstream) ---
+# Set VLLM_VA_PROBE=1 to print one line per indexer-source layer per forward:
+# which candidate mode the layer runs in and whether the packed-cache device op is used.
+_VA_PROBE = os.environ.get("VLLM_VA_PROBE", "") == "1"
 
 V41_METADATA_BUFFER_SIZE = 1024
 
@@ -565,6 +572,23 @@ class AscendDSAV41Impl:
             )
 
     def _select_sparse_indices(self, attn, hidden_states, qr, positions, cos, sin, metadata, prepared_indexer=None):
+        if _VA_PROBE:
+            print(
+                "[VA_PROBE] index_source=%s candidate_source=%s uses_cfilter=%s "
+                "has_long=%s ratio=%s packed=%s cand=%sx%s tokens=%s"
+                % (
+                    self.role.is_index_source,
+                    self.role.is_candidate_source,
+                    self.role.uses_candidate_filter,
+                    self.role.has_long_context,
+                    getattr(attn, "compress_ratio", "?"),
+                    getattr(getattr(attn, "indexer", None), "packed_cache_ops", None) is not None,
+                    self.topology.candidate_topk_blocks,
+                    self.topology.candidate_block_size,
+                    hidden_states.shape[0],
+                ),
+                flush=True,
+            )
         hidden_states = self._indexer_hidden_states(hidden_states, metadata)
         if not self.role.has_long_context:
             return None
