@@ -56,3 +56,20 @@ bash _tmp_preflight/bench_client.sh 8900 /home/a00821909/bench
 bash _tmp_preflight/complete_image_tree.sh      # 补 54 个 .py + 全量内容 diff
 PROBE=1 FULLTREE=1 bash _tmp_preflight/run_b.sh # diff 干净时用这个
 ```
+
+## Profiling（vllm-ascend 的坑）
+
+`vllm_ascend/profiler/torch_npu_profiler.py` 用的是 `torch_npu.profiler` + `export_type=Text`，
+所以产物格式和 sglang 一样（`*_ascend_pt/ASCEND_PROFILER_OUTPUT/`），`collect_profile_bundle.py` 直接能用。
+
+但注意它写死了 `with_stack=False` 且 `data_simplification=True` ⇒ **拿不到逐算子的 Python 调用栈**
+（`dump_callstack.py` 会空手）；`with_modules` 由 `torch_profiler_with_stack` 控制，可能只有 module 级事件。
+
+触发方式（服务起好之后）：
+
+```bash
+curl -s -X POST http://127.0.0.1:8900/start_profile
+bash _tmp_preflight/bench_client.sh 8900 /home/a00821909/bench   # 跑一遍
+curl -s -X POST http://127.0.0.1:8900/stop_profile
+find /home/a00821909/va_prof -name "kernel_details.csv" | head
+```
