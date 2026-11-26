@@ -48,7 +48,7 @@ ALIASES = {
 KERNEL_FIELDS = ["Stream ID", "Name", "Type", "Accelerator Core", "Duration(us)",
                  "aic_mac_ratio", "aic_mte1_ratio", "aic_mte2_ratio", "aic_fixpipe_ratio",
                  "aiv_vec_ratio", "aiv_mte2_ratio", "aiv_mte3_ratio",
-                 "cube_utilization(%)", "Block Dim", "OP State"]
+                 "cube_utilization(%)", "Block Num", "Input Shapes", "OP State"]
 
 # 算子桶：按名字/类型里的关键字归类。顺序敏感（先匹配先归类）。
 BUCKETS = [
@@ -214,6 +214,25 @@ def main() -> int:
         w.writerow(keep_cols)
         for r in top_rows:
             w.writerow([r.get(c, "") for c in keep_cols])
+
+    # ---------- 3b. 索引器/mHC 等关键算子的逐次调用明细（拟合 cost-vs-S 用）
+    c_shape = col(rows, "shape") or ("Input Shapes" if "Input Shapes" in fields_src else None)
+    c_block = "Block Num" if "Block Num" in fields_src else None
+    with open(os.path.join(dst, "va_calls.csv"), "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["bucket", "Name", "Duration(us)", "Block Num", "Input Shapes", "Start Time(us)"])
+        for r in rows:
+            nm = (r.get(c_name) or "?") if c_name else "?"
+            t = (r.get(c_type) or "") if c_type else ""
+            b = bucket_of(nm, t)
+            if b not in ("indexer", "mla_attn", "mhc"):
+                continue
+            if fnum(r.get(c_dur)) < 500.0:      # 只留 >0.5ms 的调用，控制体积
+                continue
+            w.writerow([b, nm, "%.1f" % fnum(r.get(c_dur)),
+                        r.get(c_block, "") if c_block else "",
+                        r.get(c_shape, "") if c_shape else "",
+                        r.get(c_start, "") if c_start else ""])
 
     # ---------- 4. 原样截断 op_statistic / 复制 step_trace_time
     for name, out, key in (("op_statistic.csv", "op_statistic_top.csv", "Total Time(us)"),
