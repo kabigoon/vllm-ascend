@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import glob
 import gzip
 import json
 import os
@@ -32,7 +33,7 @@ BUNDLE_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "profile_
 
 # torch_npu 导出的 kernel_details.csv 用这些列名；不同 CANN 小版本略有差异，做别名兼容
 ALIASES = {
-    "name": ["Name", "Kernel Name", "kernel_name", "OP Name"],
+    "name": ["Name", "Kernel Name", "kernel_name", "OP Name", "Op Name"],
     "type": ["Type", "Kernel Type", "OP Type"],
     "dur": ["Duration(us)", "Duration", "duration"],
     "start": ["Start Time(us)", "Start Time", "StartTime", "Timestamp"],
@@ -62,78 +63,26 @@ BUCKETS = [
 ]
 
 
-def pick_rank(root: str) -> tuple[str, str]:
-    """挑一个 rank 目录：优先「kernel_details 最大」的那个（拿到请求的 rank 料最多）。"""
-    cands = []
-    for dirpath, dirnames, _ in os.walk(root):
-        if "ASCEND_PROFILER_OUTPUT" in dirnames:
-            kd = os.path.join(dirpath, "ASCEND_PROFILER_OUTPUT", "kernel_details.csv")
-            cands.append((os.path.getsize(kd) if os.path.isfile(kd) else 0, dirpath))
-    if not cands:
-        raise SystemExit("[fatal] %s 下没有 *ASCEND_PROFILER_OUTPUT* 目录" % root)
-    cands.sort(reverse=True)
-    if len(cands) > 1:
-        print("[info] 找到 %d 个 rank 目录，取最大的一个（%d 个 >0 字节）"
-              % (len(cands), sum(1 for s, _ in cands if s)))
-        for s, d in cands[:5]:
-            print("        %8.1f MB  %s" % (s / 1e6, os.path.relpath(d, root)))
-    return cands[0][1], cands[0][0]
+def find_csv(root: str) -> tuple[str, list[dict]]:
+    """按优先级找一份「kernel 级」CSV，返回 (路径, 行列表)。
 
-
-def load_trace_rows(root: str) -> tuple[list[dict], str]:
-    """回退路径：直接解析 chrome trace（*_ascend_pt/**/trace_view.json 或 *.pt.trace.json.gz）。
-
-    torch_npu 的 ascend trace 里，kernel 事件形如
-      {"ph":"X","cat":"kernel","name":"...","dur":123.4,"ts":...,"args":{...比率/Block Dim...}}
-    args 里带着 Stream ID / Accelerator Core / aic_mac_ratio 等，信息量和 CSV 接近。
+    优先级：torch_npu Text 导出的 kernel_details.csv > msprof 导出的 op_summary*.csv
+            > 任何 kernel*.csv。同一优先级里取行数最多的那份。
     """
-    cands = []
-    for dp, _, fns in os.walk(root):
-        for fn in fns:
-            low = fn.lower()
-            if low.endswith((".pt.trace.json.gz", ".pt.trace.json")) or low == "trace_view.json":
-                fp = os.path.join(dp, fn)
-                try:
-                    cands.append((os.path.getsize(fp), fp))
-                except OSError:
-                    pass
-    if not cands:
-        raise SystemExit("[fatal] %s 下既没有 ASCEND_PROFILER_OUTPUT 也没有 trace json" % root)
-    cands.sort(reverse=True)
-    for size, fp in cands[:6]:
-        print("[info] 回退解析 trace: %.1f MB  %s" % (size / 1e6, os.path.relpath(fp, root)))
-        try:
-            with (gzip.open(fp, "rt", errors="replace") if fp.endswith(".gz")
-                  else open(fp, errors="replace")) as f:
-                js = json.load(f)
-        except Exception as e:  # noqa: BLE001
-            print("        [warn] 解析失败: %s" % e)
-            continue
-        evs = js.get("traceEvents") if isinstance(js, dict) else js
-        rows = []
-        for e in evs or []:
-            if e.get("ph") != "X":
-                continue
-            cat = (e.get("cat") or "").lower()
-            if cat not in ("kernel", "kernels", "aicore", "ai_core"):
-                continue
-            a = e.get("args") or {}
-            rows.append({
-                "Name": e.get("name", "?"),
-                "Type": a.get("Type", a.get("type", "")),
-                "Duration(us)": e.get("dur", 0.0),
-                "Start Time(us)": e.get("ts", 0.0),
-                "Stream ID": str(a.get("stream_id", a.get("Stream ID", "?"))),
-                "Accelerator Core": a.get("Accelerator Core", a.get("accelerator_core", "?")),
-                "aic_mac_ratio": a.get("aic_mac_ratio", ""),
-                "cube_utilization(%)": a.get("cube_utilization", ""),
-                "Block Dim": a.get("Block Dim", a.get("block_dim", "")),
-            })
-        if rows:
-            print("        得到 %d 个 kernel 事件" % len(rows))
-            return rows, fp
-        print("        [warn] 没有 kernel 事件（可能是 API server 侧的 cpu trace），换下一个")
-    raise SystemExit("[fatal] 所有 trace 里都找不到 kernel 事件")
+    for pat in ("**/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+                "**/kernel_details.csv",
+                "**/op_summary*.csv",
+                "**/kernel*.csv"):
+        best, best_n = None, 0
+        for fp in glob.glob(os.path.join(root, pat), recursive=True):
+            rows = read_rows(fp)
+            if len(rows) > best_n:
+                best, best_n = fp, len(rows)
+        if best:
+            print("[info] 用 CSV: %s  (%d 行, %.1f MB)"
+                  % (os.path.relpath(best, root), best_n, os.path.getsize(best) / 1e6))
+            return best, read_rows(best)
+    return "", []
 
 
 def read_rows(path: str) -> list[dict]:
@@ -186,20 +135,16 @@ def main() -> int:
     dst = os.path.join(BUNDLE_ROOT, tag)
     os.makedirs(dst, exist_ok=True)
 
-    rank_dir, ap_dir, kd_size, rows, source = "", "", 0, [], ""
-    try:
-        rank_dir, kd_size = pick_rank(args.root)
-        ap_dir = os.path.join(rank_dir, "ASCEND_PROFILER_OUTPUT")
-        kd = os.path.join(ap_dir, "kernel_details.csv")
-        rows = read_rows(kd)
-        source = kd
-        print("[info] kernel_details.csv: %.1f MB / %d 行" % (kd_size / 1e6, len(rows)))
-        if not rows:
-            raise SystemExit("[warn] kernel_details.csv 是空的，回退解析 chrome trace")
-    except SystemExit:
-        print("[warn] 没有 ASCEND_PROFILER_OUTPUT/kernel_details.csv，回退解析 chrome trace")
+    source, rows = find_csv(args.root)
+    if rows:
+        rank_dir = os.path.dirname(source)
+        kd_size = os.path.getsize(source)
+        ap_dir = rank_dir
+    else:
+        print("[warn] 没有任何可用 CSV，回退解析 chrome trace")
         rows, source = load_trace_rows(args.root)
         rank_dir, kd_size = os.path.dirname(source), os.path.getsize(source)
+        ap_dir = rank_dir
 
     c_name, c_type, c_dur = col(rows, "name"), col(rows, "type"), col(rows, "dur")
     c_start, c_core, c_stream = col(rows, "start"), col(rows, "core"), col(rows, "stream")
